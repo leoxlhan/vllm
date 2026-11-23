@@ -1745,6 +1745,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             min_decode_len = int(decode_lens_cpu.min().item())
             write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
+            native_layout = not (self.use_flattening or self.supports_varlen)
+            padding_only_native_graph = (
+                max_decode_len == 0
+                and self.use_pcp
+                and num_prefills == 0
+                and not self.use_adaptive_verification
+                and next_n > 1
+                and native_layout
+                and not custom_rows
+            )
             if self.use_adaptive_verification:
                 # Varlen FULL graphs are captured by distributing the graph's
                 # token bucket over as many one-token dummy requests as
@@ -1755,17 +1765,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # rows at replay.
                 max_decode_len = next_n
                 write_is_uniform = False
+            elif padding_only_native_graph:
+                # An idle PCP rank still replays the uniform native decode graph.
+                # Its real query lengths are zero, but DeepGEMM needs the graph's
+                # query width when building its schedule (including for all padding).
+                max_decode_len, remainder = divmod(num_decode_tokens, num_decodes)
+                native_layout = remainder == 0 and max_decode_len > 0
+                write_is_uniform = False
             # The kernel sees max_decode_len Q rows, not the configured next_n,
             # so legality is per-step: on SM90 a uniformly 3-deep batch has no
             # native kernel. max_decode_len <= 1 always has one.
             step_next_n_ok = max_decode_len <= 1 or _supports_native_decode(
                 max_decode_len
             )
-            use_native = (
-                not (self.use_flattening or self.supports_varlen)
-                and max_decode_len <= next_n
-                and step_next_n_ok
-            )
+            use_native = native_layout and max_decode_len <= next_n and step_next_n_ok
 
             if not self.supports_varlen:
                 global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
@@ -1840,6 +1853,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         max_decode_len=max_decode_len,
                     )
                 )
+
+                if padding_only_native_graph and use_native:
+                    # The uniform graph's Q rows are already rectangular. Packing
+                    # them by the real (all-zero) lengths would recreate width 0.
+                    requires_padding = False
 
             # Flattening always returns a buffer view, including single-token
             # batches. Keep its address stable across varlen graph replays.
